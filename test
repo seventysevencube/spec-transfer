@@ -1,0 +1,308 @@
+# Governed SonarQube Cloud Remediation — C#/.NET and Gemini
+
+**Document status:** Generic implementation specification and coding-agent handoff.  
+**Audience:** Coding agents, software engineers, and security reviewers.  
+**Publication note:** This public template contains no real organization configuration, proprietary source, credentials, or private repository references. Keep actual environment details only in approved private systems.
+
+> **Instruction to the coding agent:** Treat this document as the implementation contract. Work incrementally, demonstrate each milestone, and never invent test, scanner, or security validation results. First inspect the actual repository, tooling, and approved integrations. Where the document says “verify,” inspect official API/SDK documentation and the organization's configuration before coding against it. Do not independently upload company source code or secrets to tools that have not been approved.
+
+## 1. Goal, context, and non-goals
+
+Build a **developer-triggered C#/.NET CLI** that selects an existing **SonarQube Cloud** finding in a **local C# repository**, extracts a minimal source-code context with **Roslyn**, requests tests and a minimal fix from **Gemini via the company's approved Google Cloud Vertex AI endpoint**, and validates the change through **configurable, risk-based quality gates**. A developer must review and approve the result. The same core engine should later support CI/CD orchestration.
+
+**Differentiator:** This is not merely “send finding to LLM, apply patch.” The framework must apply a **test-first process**, enforce **scope and security policies**, perform **independent build/test/scanner checks**, classify **issue risk and actual patch risk separately**, and produce an **auditable evidence report**.
+
+**Assumed scope:** implementation in C#; SonarQube **Cloud**, not Server; Gemini through an authorized **Vertex AI API**; a C#/.NET repository (which may contain multiple projects); initial interface is a local console tool, not an automatic merge bot.
+
+**Not in MVP:** autonomous commits/pushes/merges; modification of Sonar rules to make a finding disappear; mass-fixing an issue backlog; full repository upload to Gemini; guaranteed runtime dependency discovery; a custom AI agent/MCP layer unless it demonstrably simplifies a specific requirement. Use the SonarQube Cloud REST API initially, not MCP.
+
+## 2. Critical decisions and prerequisites to resolve *inside the company*
+
+Before writing an external integration, obtain or inspect the following. Ask a concise question only when the repository and environment do not answer it:
+
+| Area | Required facts / decision |
+|---|---|
+| Repository | .NET SDK/runtime and target framework, `.sln`/`.csproj`, test framework and commands, build environment, Git branch policy |
+| SonarQube Cloud | **US or EU instance**; organization key and project key; issue/branch permissions; whether CI or automatic analysis is currently configured; branch/PR analysis availability |
+| Vertex AI | Approved Google Cloud project, location, Gemini model ID, IAM/ADC authentication method, input logging/retention and source-code classification approval |
+| Controls | Approved execution environment; whether local scanner uploads and temporary branch/PR analysis are permitted; security tools; who may approve remediation |
+
+**Sonar API endpoints are region-specific.** V1 is `https://sonarcloud.io/api` for the EU instance and `https://sonarqube.us/api` for the US instance. The V2 APIs are evolving, so use the live instance's API documentation for the specific endpoints and parameters. Use bearer token authentication, project-scoped permissions, pagination, and rate-limit handling. A read-only issue lookup does **not** perform a new Sonar analysis.
+
+**Vertex AI SDK:** First evaluate the current official `Google.GenAI` .NET package, which supports Vertex/Google Cloud authentication. Configure the SDK for **Vertex AI / enterprise service**, not Gemini Developer API with a personal API key. Use an organization-approved identity (prefer Application Default Credentials / workload identity) and explicit project, region, and model configuration. Do not embed service-account keys in code or JSON files. Use the version/initialization recommended by the SDK actually available in the company.
+
+**Source-code permission:** An approved Gemini endpoint is not automatic permission to transmit all proprietary source. Enforce an allowlist for permissible file paths/data classes, send only minimal snippets, redact secrets, and avoid logging prompts or responses that contain proprietary code unless explicitly authorized.
+
+## 3. System architecture
+
+```text
+.NET CLI (commands / display / approval)
+    |
+    v
+Remediation Orchestrator + Run State Machine
+    |-- SonarCloudClient          -> read finding/rule/branch/status via REST
+    |-- WorkspaceManager         -> local repo checks; isolated Git worktree
+    |-- RoslynContextResolver    -> enclosing syntax member, symbols, relevant dependencies
+    |-- ContextPolicyGuard       -> source minimization; secrets/paths; size bounds
+    |-- IssueRiskClassifier      -> Sonar metadata + deterministic rules
+    |-- GeminiVertexClient       -> bounded request/structured response
+    |-- TestProposalManager      -> review/add/freeze test additions
+    |-- PatchVerifier/Applier    -> expected hashes; allowlisted paths; scope check
+    |-- PatchRiskClassifier      -> Git diff + Roslyn semantic/public-contract indicators
+    |-- GateRunner               -> build, tests, coverage, security, Sonar verification
+    |-- EvidenceStore            -> redacted run metadata and gate outcomes
+    `-- Review/ApprovalService    -> human approval; never autonomous merge
+```
+
+Use **interfaces and dependency injection** to make Sonar, Gemini, process execution, policy, and evidence independently mockable. Prefer a small solution over a general-purpose agent framework. Recommended projects, only if the repository warrants separation: `Remediation.Cli`, `Remediation.Core`, `Remediation.Infrastructure`, `Remediation.Tests`.
+
+Suggested interfaces (contract only; exact names/types may evolve):
+
+```csharp
+public interface ISonarIssueClient { Task<SonarIssue> GetIssueAsync(string key, CancellationToken ct); }
+public interface ICodeContextResolver { Task<CodeContext> ResolveAsync(SonarIssue issue, string repositoryPath, CancellationToken ct); }
+public interface IRemediationModel { Task<TestProposal> ProposeTestsAsync(RemediationRequest request, CancellationToken ct); Task<PatchProposal> ProposeFixAsync(RemediationRequest request, CancellationToken ct); }
+public interface IRiskClassifier { RiskAssessment ClassifyIssue(SonarIssue issue); RiskAssessment ClassifyPatch(PatchSummary patch); }
+public interface IValidationGate { string Id { get; } Task<GateResult> EvaluateAsync(RemediationRun run, CancellationToken ct); }
+```
+
+**No model-controlled shell execution.** The application, not Gemini, chooses from an approved allowlist of build/test/scanner commands. Treat Sonar issue descriptions, source comments, and model output as *untrusted input*; they cannot override system permissions, gate criteria, or patch boundaries.
+
+## 4. User experience / proposed commands
+
+These are **commands to implement**, not claims that an executable already exists:
+
+```text
+remediator doctor --repo <path>
+remediator issues --project <projectKey> --branch <branch> [--limit 20]
+remediator inspect --issue <issueKey> --repo <path>
+remediator run --issue <issueKey> --repo <path> [--policy policy.json] [--dry-run]
+remediator report --run <runId>
+remediator review --run <runId>
+```
+
+- `doctor`: validate local SDK/project, auth/connectivity, approved data-transfer settings, scanner configuration and test commands without changing files.
+- `issues`: retrieve and display findings with pagination/filtering; do not automatically process an entire backlog.
+- `inspect`: show issue, matched source location, context preview, and potential data disclosure **before the Vertex call**.
+- `run`: guide a single issue through tests, patch proposal and applicable gates in an isolated worktree. `--dry-run` must never write production files, execute AI-proposed code, or upload source to Gemini; define any read-only API calls clearly.
+- `report` / `review`: produce and inspect evidence, show Git diff, and capture explicit human approval/denial. No automatic commit/push.
+
+A run must have a correlation ID, selected issue, Sonar project/branch, original local Git commit SHA, policy version/hash, approved model name/region, and timestamps.
+
+## 5. Exact remediation workflow (state machine)
+
+1. **Preflight / match source.** Require a clean Git working tree or create an isolated, disposable worktree from a known commit. Verify selected Sonar project/branch corresponds to the source being inspected. **Do not trust a Sonar line number** if local source has drifted from the analyzed revision; stop or require explicit reviewer remapping.
+2. **Fetch issue.** Query the Cloud issue and rule details (including issue key, component/file location, primary/secondary locations where available, rule key, message, status, impacts/software qualities and severity). Handle missing locations, security hotspots and inaccessible files gracefully; do not assume every finding is line-based.
+3. **Establish baseline.** Build and run existing tests *before modifying anything*. Record exit codes, results, test counts and pre-existing failures. Baseline build failure blocks by default; configurable manual exception only.
+4. **Resolve context.** Use Roslyn to find the smallest enclosing meaningful syntax member (method/constructor/property/accessor/local function/class fallback). Include signatures, references/selected dependencies, and minimum needed rule context. Present planned snippet boundaries. **Do not send full repo.** If context is unresolved or oversize, ask for a targeted expansion or stop.
+5. **Initial risk and gate plan.** Deterministically classify issue risk using Sonar metadata and policy-sensitive paths (e.g. auth, persistence, public contracts). Select preliminary mandatory gates.
+6. **Propose tests first, if warranted.** Ask Gemini for targeted regression/behavior tests separately from the production patch. Have the developer or a deterministic validator review test intent; reject test deletion/weakening and tests that only assert implementation details. Apply test additions **only in the isolated worktree**, then run them against the *original* production code. For a confirmed bug, seek a meaningful red-before/green-after test. For refactoring, a passing before/after characterization test is appropriate. Cosmetic issues may be explicitly `NOT_APPLICABLE` for new tests.
+7. **Freeze tests.** Record hashes of accepted tests and prevent the production-fix phase from changing them. Revalidate hashes before and after the fix. Distinguish test compilation errors from an expected failing behavior assertion.
+8. **Propose and inspect production patch.** Gemini returns structured, bounded file edit proposals with paths and expected original-content hashes (or a diff that can be applied only when exact source matches). Parse/validate before applying. Reject path traversal, symlink escapes, unexpected files, rule suppression, wholesale rewrites and unauthorized API/dependency changes. Do **not** run arbitrary model-suggested commands.
+9. **Classify *actual* change risk.** Use Git diff and Roslyn syntax/symbol comparisons to identify changed files/members, public signatures, tests, control flow, error handling, dependency manifests and sensitive paths. Effective risk is the greater of **issue risk** and **patch risk**. Unknown context or conflicting signals should increase review requirements, not silently lower risk.
+10. **Run validation gates.** Compile; compare baseline to post-fix tests; run relevant coverage/security tools; validate scope and no test weakening; run supported local/static checks; attempt fresh SonarQube Cloud analysis only through the organization's approved scanner/CI branch process.
+11. **Review and disposition.** Display original issue, bounded code shared (metadata or hashes, not raw proprietary content by default), proposed tests, red/green evidence, diff, gate outcomes, unresolved risks, and reviewer action. Never auto-commit/push/merge.
+12. **Sonar final verification, if not yet available.** A local build does not prove Cloud resolution. Some environments require an approved commit/PR and CI analysis. If that is the case, mark **`SONAR_PENDING`** during local review; obtain developer approval to create/push a branch using the normal workflow, then verify the actual PR/branch analysis **against the correct commit** before marking Sonar verified. Do not declare the whole remediation verified earlier.
+
+**Key timing distinction:** Human review of a *candidate* may happen before Cloud analysis if publishing is necessary; a final **verified/merge-ready** disposition must await all mandatory gates. Do not pretend a private local worktree has already passed remote Sonar analysis.
+
+## 6. Configurable quality gates
+
+Gate results must be one of **`PASS`, `FAIL`, `PENDING`, `NOT_APPLICABLE`, `WAIVED`**. Each result includes executor/tool, start/end times, inputs/version, evidence artifact reference, and a reason. `WAIVED` requires named human authority, reason, and policy permission; never let Gemini waive a gate.
+
+| ID | Name | What it proves | Default failure/exception behavior |
+|---|---|---|---|
+| **G1** | Baseline health | Existing build and tests have known starting status | Stop on build failure; baseline test failures recorded, not blamed on patch |
+| **G2** | Test-first / test integrity | Relevant tests are written and executed *before* fix, and cannot be weakened afterward | Fail if required test missing/altered; N/A for cosmetic findings by policy |
+| **G3** | Behavior preservation | Production patch compiles and introduces no new relevant test failures | Fail for new failure; never equate green tests with full semantic equivalence |
+| **G4** | Scope and API control | Only allowlisted files/members changed; unintended public contracts/dependencies not modified | Fail on unauthorized modifications or patch oversize |
+| **G5** | Coverage adequacy | Affected code is exercised and measured coverage does not fall below policy threshold | Pending if tooling unavailable, warn or fail by policy; coverage ≠ correctness |
+| **G6** | Security / dependency protection | Approved scanners detect no new prohibited security, secret or package risk | Fail on critical/new prohibited issues; specialist review for sensitive code |
+| **G7** | Fresh Sonar confirmation | Correct post-change analyzed commit shows target issue resolved and no unacceptable new findings | `PENDING`, not pass, when no authoritative Cloud analysis exists |
+| **G8** | Developer sign-off | Named reviewer accepted test intent, code diff and evidence, with unresolved items disclosed | Mandatory; cannot be completed by Gemini |
+
+**Optional risk-specific gates:** integration/contract tests, database migration safety, performance regression tests, mutation testing (e.g. Stryker.NET), and specialized security review. Configure them as extensions rather than making every low-risk finding expensive.
+
+### Findings versus proof
+
+- A Sonar issue disappearing from a new report can reflect moved lines, branch differences, a rule/profile change or status change, not necessarily a real fix. Confirm the **same rule + code location/flow + correct analyzed revision** and inspect new findings around the changed code. Issue identifiers alone may not remain stable.
+- Do not suppress rules (`#pragma`, `// NOSONAR`, global exclusions) or downgrade quality profiles to manufacture success. Any exception must be a separately reviewed policy waiver, not an AI fix.
+- A fix can have **all local gates passed** yet still remain **`SONAR_PENDING`**. Keep these separate in the report.
+
+## 7. Risk classification and policy
+
+Use two independent dimensions:
+
+**Issue risk (pre-fix):** Sonar impacts/software qualities and impact severity, rule type, selected file/path, surrounding context, and business criticality configured by the team. A Sonar severity is **not** itself a complete remediation-risk score.
+
+**Patch risk (post-proposal):** touched file count, changed lines, modified symbol kinds, public API/signature change, conditional/error-handling behavior, dependency/configuration/schema edits, changes to generated/test files, security-sensitive paths, and inability to resolve semantics. Roslyn helps detect structural changes but cannot prove the absence of behavior changes. Use deterministic heuristics plus review.
+
+| Effective risk | Examples | Extra required controls |
+|---|---|---|
+| **LOW** | Local formatting or simple refactor, small diff, no sensitive/public API change | Build, applicable tests, scope, Sonar, developer approval |
+| **MEDIUM** | Branch/exception/business logic change, contained null handling | Targeted test-first evidence, coverage, security checks and review |
+| **HIGH** | Auth/authz, crypto, public contracts, persistence, dependency changes, large/cross-cutting diffs, unresolved context | Mandatory specialist review and relevant integration/security/contract tests; fail closed on unsupported verification |
+
+**Effective risk = maximum(issue risk, actual patch risk).** Never allow the model to downgrade risk. Classifications must include human-readable rule IDs and rationale.
+
+### Starter `policy.json` (valid JSON; thresholds are example defaults, not organizational policy)
+
+```json
+{
+  "schemaVersion": 1,
+  "riskProfiles": {
+    "LOW": ["G1", "G2", "G3", "G4", "G7", "G8"],
+    "MEDIUM": ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8"],
+    "HIGH": ["G1", "G2", "G3", "G4", "G5", "G6", "G7", "G8", "specialistReview"]
+  },
+  "gates": {
+    "G2": { "allowNotApplicableForCosmeticIssues": true },
+    "G5": { "blockIfCoverageUnavailableForHighRisk": true },
+    "G7": { "requireMatchingAnalyzedRevision": true },
+    "G8": { "mandatoryForEveryRun": true }
+  },
+  "patch": {
+    "maxFilesLowRisk": 2,
+    "maxChangedLinesLowRisk": 60,
+    "forbidTestDeletion": true,
+    "forbidRuleSuppression": true,
+    "forbidDependencyChangeWithoutApproval": true,
+    "forbidPublicApiChangeWithoutApproval": true
+  },
+  "context": {
+    "maxCharactersPerRequest": 24000,
+    "requireDeveloperPreviewBeforeSending": true,
+    "forbidSecrets": true,
+    "defaultDenyUnclassifiedFiles": true
+  },
+  "execution": {
+    "autoCommit": false,
+    "autoPush": false,
+    "autoMerge": false,
+    "runTestsInIsolatedEnvironment": true
+  }
+}
+```
+
+The gate runner must treat `NOT_APPLICABLE` as valid **only** when the gate's policy explicitly allows it. Missing tools/permissions yield `PENDING` or `FAIL`, never `PASS`. Validate policy schema at startup and fail safely on unknown gate IDs or malformed policy.
+
+## 8. Roslyn implementation: precise responsibilities
+
+Use the following NuGet libraries as appropriate: `Microsoft.CodeAnalysis.CSharp.Workspaces`, `Microsoft.CodeAnalysis.Workspaces.MSBuild`, and `Microsoft.Build.Locator`. Register MSBuild with `MSBuildLocator.RegisterDefaults()` **before** loading any MSBuild assemblies. Run `dotnet restore` via the approved toolchain if necessary.
+
+**Algorithm for `RoslynContextResolver`:**
+
+1. Load the actual `.csproj` or solution with `MSBuildWorkspace`; verify workspace diagnostics and required references. Resolve source path under repo root, validate line/range against file content, and determine whether the revision is compatible with Sonar's analyzed source.
+2. `document.GetSyntaxRootAsync()` obtains syntax; `document.GetTextAsync()` maps 1-based Sonar lines/ranges to source positions. Locate `root.FindToken(position)` then walk `AncestorsAndSelf()` to enclosing method/constructor/property/accessor/local function/operator; fall back to enclosing type when appropriate.
+3. `document.GetSemanticModelAsync()` obtains semantics. For each relevant invocation, call `semanticModel.GetSymbolInfo(invocation)` and inspect `IMethodSymbol`, `DeclaringSyntaxReferences` and source locations to find **resolvable direct references**. Bound depth, fan-out, and context size; include only a few selected dependencies.
+4. Capture method signatures, parameter/return types, relevant class fields/properties and selected interface contracts, preserving correct namespace/import context. Resolve existing tests through a best-effort symbol/name search and project/test references; **do not claim Roslyn can reliably identify all tests**.
+5. Emit a `CodeContext` with source file hashes, ranges, snippets, unresolved symbols, reason for selection, and content size. Mark any heuristic or incomplete resolution as such.
+
+**Limitations:** runtime dependency injection, reflection, dynamic dispatch, expression trees, cross-service calls and configuration-dependent flows are not completely inferable from Roslyn. A syntactic method match is not proof of all runtime dependencies. If the issue is at a class-level location or generated code, handle with a safe fallback or request review. Avoid brittle regex extraction.
+
+### Test fixture requirement for this component
+
+Build a small local sample project containing: a normal method, constructor, property, local function, interface-dispatched call, dependency-injected field, and an unresolvable external call. Verify the context resolver gives correct enclosing members, does not crash on missing symbols, and labels unresolved dependency edges.
+
+## 9. External API and execution requirements
+
+**SonarCloudClient**
+- Read issues and associated rule details through endpoints supported by the selected Sonar Cloud instance. As of the existing API, `GET /api/issues/search` and `GET /api/rules/show` are candidates; **confirm current availability and parameters on the company's US/EU instance before implementation**. Handle pagination, branch filters, partial fields/locations, `401`/`403`/`404`/`429` and retries with bounded exponential backoff. Do not assume issue metadata supplies a reliable exact Git SHA; use branch/analysis metadata and/or explicit local confirmation.
+- Never modify issue status, rules, permissions or quality profiles as part of remediation.
+- For a fresh Cloud analysis, use the organization's configured **SonarScanner for .NET + build + end** or its existing CI integration; REST issue search alone is not analysis. Scanner configuration, permissions, analysis branch availability and token handling are environment-specific. When analysis is asynchronous, poll task completion before querying issues.
+
+**GeminiVertexClient**
+- Use the approved project/location/model, managed/ADC identity, request timeout and retry policy. Send Sonar issue description, selected method/test context, constraints, existing test setup and minimal relevant dependencies **as text**, not as an entire repository upload.
+- Use structured model output (e.g. JSON schema for `TestProposal` and `PatchProposal`); validate it with strict .NET schema/DTO validation. Treat bad JSON, incomplete/ambiguous patch, refusal, unsafe instructions, excessive tokens, quota errors and timeouts as explicit failure states.
+- Ask for **test intent** and **production patch** in separate requests; neither response grants itself permission to run commands, apply unrelated edits, or pass a gate.
+- Do not place API keys, source snippets or model output containing confidential code in default logs, crash reports, telemetry or evidence artifacts.
+
+**Workspace and validation**
+- Run on a separate Git worktree or equivalent isolation, never modifying the developer's working tree without explicit approval. Check symlinks, path traversal, source hashes and Git status before and after applying patches.
+- Use a fixed allowlist of executable commands/arguments determined by the actual project; timeouts, process exit codes, and captured output limits are required. Restrict network and secrets during generated code/test execution. Because .NET builds/tests can execute arbitrary project code, use a company-approved sandbox/CI worker for untrusted generated changes rather than assuming a process is safe merely because it is `dotnet test`.
+- Evidence includes commands executed, tool versions, statuses, test counts, baseline delta, source commit, changed file metadata, hashes, gates and reviewer sign-off; do not retain proprietary prompt bodies unless explicitly approved.
+
+## 10. Evidence schema and review outcomes
+
+Each run should generate **redacted `report.json` and readable `report.md`**, with stable identifiers and fields along these lines:
+
+```json
+{
+  "runId": "example-run-001",
+  "sourceRevision": "original-commit-sha",
+  "sonar": { "projectKey": "configured-project", "branch": "feature/example", "issueKey": "example-issue", "analysisRevision": null },
+  "ai": { "provider": "Vertex AI Gemini", "model": "approved-configured-model", "region": "configured-region" },
+  "risk": { "issue": "MEDIUM", "patch": "HIGH", "effective": "HIGH", "reasons": ["public signature changed"] },
+  "gates": [
+    { "id": "G1", "status": "PASS", "evidence": "baseline-tests.xml" },
+    { "id": "G7", "status": "PENDING", "reason": "approved PR analysis not run" },
+    { "id": "G8", "status": "PENDING", "reason": "awaiting developer approval" }
+  ],
+  "candidateStatus": "LOCALLY_VALIDATED_PENDING_SONAR",
+  "reviewer": null
+}
+```
+
+Statuses must be consistent:
+- `REJECTED`: violated a required non-waived gate, or invalid/unsafe patch.
+- `LOCALLY_VALIDATED_PENDING_SONAR`: applicable local checks succeeded, authoritative Cloud analysis still unavailable.
+- `SONAR_VERIFIED_PENDING_APPROVAL`: all required technical checks, including matching Cloud analysis, succeeded, but G8 is incomplete.
+- `APPROVED`: authorized reviewer signed off **and** all required non-waived technical gates passed. An early approval to publish a branch is **not** final merge approval.
+- `NEEDS_MANUAL_REVIEW`: uncertain semantics, incomplete context, authorized waiver decision, or other non-automatable evidence.
+
+Do not represent `PENDING` and `WAIVED` as a green check. A high-risk change cannot be fully approved while a mandatory security/contract gate is missing.
+
+## 11. Milestones, deliverables and acceptance criteria
+
+**M0 — Repository/environment discovery (no source sent to Vertex AI)**
+- Output `architecture-decisions.md` with discovered toolchain, test commands, Sonar region, approved Vertex configuration, unresolved policy questions, and least-privilege permission needs.
+- **Done when:** the company has approved the minimal source disclosure pathway and build/scanner prerequisites are understood.
+
+**M1 — Roslyn proof of concept (fully local, no Gemini/Sonar credentials required)**
+- Implement context resolver from `.csproj`, file path and 1-based source line. Include tests for all syntax forms in section 8, bounded direct references, and unresolved symbols.
+- **Done when:** test fixture passes; API output includes correct method/class or explicit fallback, source ranges and dependency notes.
+
+**M2 — SonarQube Cloud read-only integration**
+- Add region-configurable API client, project/branch/issue selection, pagination, rule lookup, revision mismatch handling, and deterministic issue risk.
+- **Done when:** a developer can fetch a real authorized issue without changing Sonar settings or local code; errors are clear and no tokens are logged.
+
+**M3 — Gemini via approved Vertex AI (proposal only)**
+- Generate bounded test and code patch *proposals* with schema validation, context preview, explicit model/region, timeouts and data guards.
+- **Done when:** mock and approved real-endpoint tests show only permitted snippets are submitted, malformed output is rejected, and no files are automatically modified.
+
+**M4 — Test-first and safe patch application**
+- Implement isolated worktree, baseline tests, test proposal review, red/green evidence, test freeze, scoped patch applying, code diff and reclassification.
+- **Done when:** happy path and adversarial cases (unrelated file edit, deleted test, source hash mismatch, syntax error, suggested command execution) behave safely.
+
+**M5 — Gates and evidence reporting**
+- Implement policy schema, G1–G8, risk-based selection, approved scanner integration or honest `SONAR_PENDING`, report generation and explicit developer sign-off.
+- **Done when:** a seeded defective method can be remediated end-to-end with reproducible evidence; no fake `PASS` statuses; security and unavailable-scanner failures are surfaced.
+
+**M6 — Optional CI integration, only after a working CLI**
+- Reuse engine and policy; CI should produce reports/PR review artifacts and never auto-merge. Preserve identical semantics for gate outcomes.
+
+### Required automated tests for the framework itself
+
+- API client mocks: success, empty issue, missing location, branch mismatch, pagination, `401/403/404/429`, timeout.
+- Roslyn: all syntax variations, correct source ranges, unresolved semantic references, source out-of-sync.
+- Context/data guard: secret redaction, forbidden file, oversize snippet, path traversal, secondary-location handling.
+- Model: invalid JSON, unsafe file modification, refusal, oversized patch, token/quota failure.
+- Gate engine: different required gates per risk, pending is not pass, waiver audit, frozen tests, unchanged baseline failures, failed scanner, stale scanner results.
+- Workspace: dirty tree, interrupted run, conflict, rollback/cleanup, no unintended writes, no unapproved network publication.
+
+## 12. Execution instructions to Claude (copy verbatim if needed)
+
+> You are implementing a production-oriented **C#/.NET CLI** as specified in this document. Begin with **M0 and M1 only**. Inspect the actual repository/toolchain first; avoid guessing SDK versions, Sonar region/branch capabilities, and company Vertex AI configuration. For M1, build a working Roslyn context resolver and unit tests on synthetic/sample code, with explicit limits for dependency discovery. Provide compiling code, tests, exact commands to run, and a summary of unresolved environment requirements. Your company-approved Claude agent may inspect local repository files only within company policy; do not call Vertex or upload proprietary source to another AI service until explicitly approved. Do not make commits, pushes, PRs or merges without an explicit developer instruction. After demonstrating M1, ask for approval to proceed to M2. Throughout development, enforce gate results independently of Gemini and never report success without evidence.
+
+## 13. References for the agent to verify
+
+- SonarQube Cloud Web API and region/auth: https://docs.sonarsource.com/sonarqube-cloud/appendices/web-api
+- SonarScanner for .NET (Cloud): https://docs.sonarsource.com/sonarqube-cloud/analyzing-source-code/scanners/sonarscanner-for-dotnet/using
+- Sonar issues/locations: https://docs.sonarsource.com/sonarqube-cloud/managing-your-projects/issues/reviewing
+- Google Gen AI .NET SDK: https://googleapis.github.io/dotnet-genai/
+- Microsoft Roslyn: https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/
+- MSBuildLocator: https://github.com/microsoft/MSBuildLocator
+
+## 14. Using this public template in a private environment
+
+This is a **generic example architecture**, not a preapproved corporate implementation. Copy it into an authorized private workspace and adapt only after the organization approves the use of external AI services and source disclosure. Never commit proprietary source, credentials, internal endpoints, real issue IDs, logs, or actual organization configuration to this public repository. Follow approved network and transfer policies; do not bypass organizational controls to move files.
